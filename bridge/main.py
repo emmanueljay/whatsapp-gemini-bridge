@@ -370,7 +370,16 @@ async def fetch_waha_lid_map(client: httpx.AsyncClient) -> Dict[str, str]:
 async def lookup_contacts_and_chats(query: str) -> List[Dict[str, str]]:
     """Search SQLite contacts, Google Sheet Contacts tab, WAHA chats, and WAHA contacts for query."""
     q = (query or "").strip().lower()
+    q_words = [w for w in q.split() if len(w) >= 2] if q else []
     results: Dict[str, str] = {}
+
+    def _matches(text_a: str, text_b: str) -> bool:
+        if not q:
+            return True
+        combined = f"{text_a} {text_b}".lower()
+        if q in combined:
+            return True
+        return any(w in combined for w in q_words)
 
     # 1. SQLite saved contacts
     try:
@@ -378,7 +387,7 @@ async def lookup_contacts_and_chats(query: str) -> List[Dict[str, str]]:
             rows = conn.execute("SELECT name, chat_id FROM contacts").fetchall()
             for name, cid in rows:
                 norm_cid = format_phone_or_jid(cid)
-                if not q or q in name.lower() or q in norm_cid.lower():
+                if _matches(name, norm_cid):
                     results[norm_cid] = name
     except Exception as exc:
         logger.debug("SQLite contacts lookup warning: %s", exc)
@@ -398,7 +407,7 @@ async def lookup_contacts_and_chats(query: str) -> List[Dict[str, str]]:
                     if len(row) >= 2 and str(row[0]).strip() and str(row[1]).strip():
                         name = str(row[0]).strip()
                         cid = format_phone_or_jid(str(row[1]).strip())
-                        if not q or q in name.lower() or q in cid.lower():
+                        if _matches(name, cid):
                             results[cid] = name
             except Exception as exc:
                 logger.debug("Sheet Contacts lookup warning: %s", exc)
@@ -418,7 +427,7 @@ async def lookup_contacts_and_chats(query: str) -> List[Dict[str, str]]:
                     if cid.endswith("@lid"):
                         continue
                     name = str(c.get("name") or c.get("pushname") or "").strip()
-                    if not q or q in cid.lower() or q in name.lower():
+                    if _matches(name, cid):
                         if cid and (cid not in results or not results[cid] or results[cid] == cid):
                             results[cid] = name or cid
         except Exception as exc:
@@ -438,9 +447,9 @@ async def lookup_contacts_and_chats(query: str) -> List[Dict[str, str]]:
                     name = (
                         str(c.get("name") or c.get("pushname") or c.get("shortName") or "").strip()
                     )
-                    if not name and q and q not in cid.lower():
+                    if not name and q and not _matches("", cid):
                         continue
-                    if not q or q in cid.lower() or q in name.lower():
+                    if _matches(name, cid):
                         if cid and (cid not in results or results[cid] == cid):
                             results[cid] = name or cid
         except Exception as exc:
@@ -773,9 +782,9 @@ You are speaking directly with the owner of this WhatsApp bridge (in their "Mess
 You have access to tools to search WhatsApp contacts/chats (`search_whatsapp_contacts`), send WhatsApp messages to other people (`send_whatsapp_message`), save contact numbers (`save_whatsapp_contact`), and read recent messages (`get_recent_whatsapp_messages`).
 
 Rules when the owner asks you to send a WhatsApp message to someone:
-1. ALWAYS call `search_whatsapp_contacts` first if they give a person's name instead of a phone number.
+1. Call `search_whatsapp_contacts` ONCE with the person's full name if they give a name instead of a phone number. Never call `search_whatsapp_contacts` multiple times for the same person (one search already checks all words in the name).
 2. If `search_whatsapp_contacts` returns NO matches (because WAHA's lightweight memory mode only caches contacts after a message is exchanged or after they are saved to Contacts), or returns MULTIPLE ambiguous matches:
-   - DO NOT guess or invent a phone number, and DO NOT claim the message was sent.
+   - DO NOT call `search_whatsapp_contacts` again, DO NOT guess or invent a phone number, and DO NOT claim the message was sent.
    - Immediately reply to the owner asking for clarification (e.g., ask for the person's phone number with country code like +41... or +33..., or which contact they meant).
    - Include your drafted message in the reply so the owner can review it and simply reply with the phone number!
 3. When the owner provides a contact's phone number, call `save_whatsapp_contact` to remember it for the future, and call `send_whatsapp_message` to deliver the message.
@@ -793,8 +802,8 @@ async def execute_owner_tool_call(fn_name: str, fn_args: Dict[str, Any]) -> Dict
                 "matches": matches,
                 "count": len(matches),
                 "note": (
-                    "If count is 0, ask the owner for the recipient's phone number (with country code, e.g. +41... or +33...) "
-                    "and show them the drafted message so you can send it as soon as they reply with the number."
+                    "0 matches found (all saved contacts, Google Sheet contacts, and active WhatsApp chats were already searched for every word in the query). "
+                    "DO NOT call search_whatsapp_contacts again! Immediately reply to the owner with your drafted message and ask for the recipient's phone number (with country code, e.g. +41... or +33...)."
                     if len(matches) == 0
                     else "Matches found."
                 ),
@@ -971,11 +980,32 @@ async def generate_gemini_reply(chat_id: str, user_prompt: str, is_owner: bool =
     )
 
     for _step in range(5):
-        response = await gemini_client.aio.models.generate_content(
-            model=model_name,
-            contents=history,
-            config=config,
-        )
+        if _step > 0:
+            # Brief pacing between multi-turn tool calls to avoid Vertex AI per-second DSQ burst limits
+            await asyncio.sleep(1.5)
+
+        response = None
+        for attempt in range(4):
+            try:
+                response = await gemini_client.aio.models.generate_content(
+                    model=model_name,
+                    contents=history,
+                    config=config,
+                )
+                break
+            except Exception as exc:
+                err_str = str(exc)
+                if ("429" in err_str or "RESOURCE_EXHAUSTED" in err_str) and attempt < 3:
+                    wait_sec = 4 * (attempt + 1)
+                    logger.warning(
+                        "Vertex AI 429 burst limit hit (attempt %d/4); waiting %ds before retry...",
+                        attempt + 1,
+                        wait_sec,
+                    )
+                    await asyncio.sleep(wait_sec)
+                else:
+                    raise
+
         function_calls = getattr(response, "function_calls", None)
         if not function_calls:
             return (response.text or "").strip()
