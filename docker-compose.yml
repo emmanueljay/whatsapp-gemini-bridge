@@ -1,0 +1,76 @@
+services:
+  waha:
+    image: devlikeapro/waha:noweb
+    container_name: waha
+    restart: unless-stopped
+    ports:
+      # Bind ONLY to localhost; access dashboard via SSH tunnel: ssh -L 3000:localhost:3000 <vm>
+      - "127.0.0.1:3000:3000"
+    environment:
+      - WHATSAPP_DEFAULT_ENGINE=NOWEB
+      - WAHA_NOWEB_WA_VERSION=auto-web
+      - WAHA_API_KEY=${WAHA_API_KEY}
+      - WHATSAPP_API_KEY=${WAHA_API_KEY}
+      - WAHA_DASHBOARD_ENABLED=true
+      - WAHA_DASHBOARD_USERNAME=${WAHA_DASHBOARD_USER:-admin}
+      - WAHA_DASHBOARD_PASSWORD=${WAHA_DASHBOARD_PASSWORD}
+      - WHATSAPP_SWAGGER_USERNAME=${WAHA_DASHBOARD_USER:-admin}
+      - WHATSAPP_SWAGGER_PASSWORD=${WAHA_DASHBOARD_PASSWORD}
+      - WHATSAPP_HOOK_URL=http://gemini-bridge:8000/webhook/whatsapp
+      - WHATSAPP_HOOK_EVENTS=message,message.any,session.status
+      - WHATSAPP_START_SESSION=default
+      - WHATSAPP_RESTART_ALL_SESSIONS=true
+      - WAHA_SESSION_CONFIG_IGNORE_STATUS=true
+      - WAHA_SESSION_CONFIG_IGNORE_CHANNELS=true
+      - WAHA_PRINT_QR=false
+    volumes:
+      - waha_sessions:/app/.sessions
+    deploy:
+      resources:
+        limits:
+          memory: 450M
+    networks:
+      - whatsapp-net
+
+  gemini-bridge:
+    build: ./bridge
+    container_name: gemini-bridge
+    restart: unless-stopped
+    environment:
+      - WAHA_BASE_URL=http://waha:3000
+      - WAHA_API_KEY=${WAHA_API_KEY}
+      - WAHA_SESSION=default
+      - USE_VERTEX_AI=${USE_VERTEX_AI:-true}
+      - GCP_PROJECT_ID=${GCP_PROJECT_ID:-}
+      - GCP_LOCATION=${GCP_LOCATION:-global}
+      - GEMINI_API_KEY=${GEMINI_API_KEY:-}
+      - GEMINI_MODEL=${GEMINI_MODEL:-gemini-3.8-flash}
+      - SYSTEM_PROMPT=${SYSTEM_PROMPT:-You are a helpful, concise personal AI assistant replying via WhatsApp.}
+      - SELF_CHAT_ID=${SELF_CHAT_ID:-}
+      - SELF_LID_PREFIX=${SELF_LID_PREFIX:-}
+      - ALLOWED_CHAT_IDS=${ALLOWED_CHAT_IDS:-}
+      - ALLOW_SELF_CHAT=${ALLOW_SELF_CHAT:-true}
+      - TRIGGER_PREFIX=${TRIGGER_PREFIX:-!ai}
+      - MAX_REPLIES_PER_MINUTE=${MAX_REPLIES_PER_MINUTE:-6}
+      - MAX_REPLIES_PER_HOUR=${MAX_REPLIES_PER_HOUR:-40}
+      - CONTEXT_WINDOW_MESSAGES=${CONTEXT_WINDOW_MESSAGES:-12}
+      - GOOGLE_SHEET_ID=${GOOGLE_SHEET_ID:-}
+      - SHEETS_POLL_INTERVAL_SECONDS=${SHEETS_POLL_INTERVAL_SECONDS:-20}
+    volumes:
+      - bridge_data:/app/data
+    deploy:
+      resources:
+        limits:
+          memory: 250M
+    depends_on:
+      - waha
+    networks:
+      - whatsapp-net
+
+volumes:
+  waha_sessions:
+  bridge_data:
+
+networks:
+  whatsapp-net:
+    driver: bridge
