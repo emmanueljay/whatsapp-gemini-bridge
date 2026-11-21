@@ -29,7 +29,7 @@ services:
     deploy:
       resources:
         limits:
-          memory: 450M
+          memory: 350M
     networks:
       - whatsapp-net
 
@@ -64,7 +64,7 @@ services:
     deploy:
       resources:
         limits:
-          memory: 320M
+          memory: 240M
     depends_on:
       - waha
     networks:
