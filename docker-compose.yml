@@ -60,10 +60,11 @@ services:
       - SHEETS_POLL_INTERVAL_SECONDS=${SHEETS_POLL_INTERVAL_SECONDS:-20}
     volumes:
       - bridge_data:/app/data
+      - ./bridge/main.py:/app/main.py:ro
     deploy:
       resources:
         limits:
-          memory: 250M
+          memory: 320M
     depends_on:
       - waha
     networks:

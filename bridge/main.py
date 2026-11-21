@@ -1117,6 +1117,10 @@ async def handle_incoming_message(payload: Dict[str, Any]) -> None:
     if not body:
         return
 
+    # Ignore stale historical sync bursts (>5 min old) when WAHA reconnects after VM downtime
+    if timestamp > 0 and (time.time() - timestamp) > 300:
+        return
+
     chat_id = await resolve_jid_via_lid_cache(raw_from)
     to_id = await resolve_jid_via_lid_cache(raw_to)
 
