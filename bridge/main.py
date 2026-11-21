@@ -562,7 +562,7 @@ async def configure_waha_session() -> None:
         },
     }
     async with httpx.AsyncClient(timeout=15.0) as client:
-        for attempt in range(1, 15):
+        for attempt in range(1, 60):
             try:
                 resp = await client.get(
                     f"{WAHA_BASE_URL}/api/sessions/{WAHA_SESSION}", headers=headers
@@ -1239,9 +1239,16 @@ async def health() -> Dict[str, Any]:
     }
 
 
+waha_config_lock = asyncio.Lock()
+
+
 async def _on_waha_session_working() -> None:
     await asyncio.sleep(2.0)
-    await set_waha_presence_offline()
+    if not waha_config_lock.locked():
+        async with waha_config_lock:
+            await configure_waha_session()
+    else:
+        await set_waha_presence_offline()
 
 
 @app.post("/webhook/whatsapp")
