@@ -39,6 +39,7 @@ ALLOWED_CHAT_IDS = {
 }
 ALLOW_SELF_CHAT = os.getenv("ALLOW_SELF_CHAT", "true").lower() in ("1", "true", "yes")
 TRIGGER_PREFIX = os.getenv("TRIGGER_PREFIX", "!ai").strip()
+MARK_MESSAGES_SEEN = os.getenv("MARK_MESSAGES_SEEN", "false").lower() in ("1", "true", "yes")
 
 MAX_REPLIES_PER_MINUTE = int(os.getenv("MAX_REPLIES_PER_MINUTE", "6"))
 MAX_REPLIES_PER_HOUR = int(os.getenv("MAX_REPLIES_PER_HOUR", "40"))
@@ -55,6 +56,8 @@ bot_sent_message_ids: set = set()
 gemini_client: Optional[genai.Client] = None
 sheets_service: Any = None
 sheets_lock = asyncio.Lock()
+cached_lid_map: Dict[str, str] = {}
+cached_lid_map_ts: float = 0.0
 
 
 SELF_CHAT_ID = os.getenv("SELF_CHAT_ID", "").strip()
@@ -349,8 +352,11 @@ def format_phone_or_jid(raw: str) -> str:
 
 
 async def fetch_waha_lid_map(client: httpx.AsyncClient) -> Dict[str, str]:
-    """Fetch WAHA's internal @lid -> @c.us phone number mapping table."""
-    lid_map: Dict[str, str] = {f"{SELF_LID_PREFIX}@lid": SELF_CHAT_ID}
+    """Fetch WAHA's internal @lid -> @c.us phone number mapping table and update in-memory cache."""
+    global cached_lid_map, cached_lid_map_ts
+    lid_map: Dict[str, str] = {}
+    if SELF_LID_PREFIX and SELF_CHAT_ID:
+        lid_map[f"{SELF_LID_PREFIX}@lid"] = SELF_CHAT_ID
     headers = {"X-Api-Key": WAHA_API_KEY}
     try:
         r_lids = await client.get(
@@ -362,9 +368,24 @@ async def fetch_waha_lid_map(client: httpx.AsyncClient) -> Dict[str, str]:
                 pn = normalize_chat_id(str(item.get("pn") or ""))
                 if lid and pn:
                     lid_map[lid] = pn
+            cached_lid_map.update(lid_map)
+            cached_lid_map_ts = time.time()
     except Exception as exc:
         logger.debug("WAHA lids lookup warning: %s", exc)
     return lid_map
+
+
+async def resolve_jid_via_lid_cache(raw_jid: str) -> str:
+    """Resolve an @lid JID using an in-memory cache so passive incoming messages don't ping WAHA."""
+    norm = normalize_chat_id(raw_jid)
+    if not norm.endswith("@lid"):
+        return norm
+    if norm in cached_lid_map:
+        return cached_lid_map[norm]
+    if time.time() - cached_lid_map_ts > 60.0:
+        async with httpx.AsyncClient(timeout=8.0) as client:
+            await fetch_waha_lid_map(client)
+    return cached_lid_map.get(norm, norm)
 
 
 async def lookup_contacts_and_chats(query: str) -> List[Dict[str, str]]:
@@ -492,18 +513,45 @@ async def save_contact_entry(name: str, phone_or_chat_id: str, notes: str = "") 
     return {"name": clean_name, "chat_id": clean_cid}
 
 
+async def set_waha_presence_offline(client: Optional[httpx.AsyncClient] = None) -> None:
+    """Force WAHA session presence to 'offline' so WhatsApp continues delivering phone push notifications."""
+    headers = {"X-Api-Key": WAHA_API_KEY, "Content-Type": "application/json"}
+    url = f"{WAHA_BASE_URL}/api/{WAHA_SESSION}/presence"
+    payload = {"presence": "offline"}
+    try:
+        if client is not None:
+            resp = await client.post(url, headers=headers, json=payload)
+        else:
+            async with httpx.AsyncClient(timeout=10.0) as tmp_client:
+                resp = await tmp_client.post(url, headers=headers, json=payload)
+        if resp.status_code < 300:
+            logger.info("Set WAHA session '%s' presence to offline (preserves phone notifications).", WAHA_SESSION)
+        else:
+            logger.debug("Presence offline returned HTTP %d: %s", resp.status_code, resp.text[:120])
+    except Exception as exc:
+        logger.debug("set_waha_presence_offline warning: %s", exc)
+
+
+async def keep_presence_offline_loop() -> None:
+    """Periodically re-assert offline presence every 5 minutes in case WhatsApp drifts companion state."""
+    while True:
+        await asyncio.sleep(300)
+        await set_waha_presence_offline()
+
+
 async def configure_waha_session() -> None:
-    """Ensure the default WAHA session has NOWEB store enabled and auto-detect SELF_CHAT_ID / SELF_LID_PREFIX."""
+    """Ensure the default WAHA session has markOnline=False + NOWEB store enabled, and set presence offline."""
     global SELF_CHAT_ID, SELF_LID_PREFIX
     headers = {"X-Api-Key": WAHA_API_KEY, "Content-Type": "application/json"}
     session_config = {
         "name": WAHA_SESSION,
         "config": {
             "noweb": {
+                "markOnline": False,
                 "store": {
                     "enabled": True,
                     "fullSync": False,
-                }
+                },
             },
             "webhooks": [
                 {
@@ -513,7 +561,7 @@ async def configure_waha_session() -> None:
             ],
         },
     }
-    async with httpx.AsyncClient(timeout=10.0) as client:
+    async with httpx.AsyncClient(timeout=15.0) as client:
         for attempt in range(1, 15):
             try:
                 resp = await client.get(
@@ -529,19 +577,41 @@ async def configure_waha_session() -> None:
                         SELF_LID_PREFIX = str(me_info["lid"]).split(":")[0].split("@")[0]
                         logger.info("Auto-detected SELF_LID_PREFIX: %s", SELF_LID_PREFIX)
                     cfg = data.get("config") or {}
-                    store_cfg = (cfg.get("noweb") or {}).get("store") or {}
-                    if not store_cfg.get("enabled"):
-                        logger.info("Updating WAHA session '%s' to enable NOWEB store...", WAHA_SESSION)
+                    noweb_cfg = cfg.get("noweb") or {}
+                    store_cfg = noweb_cfg.get("store") or {}
+                    if not store_cfg.get("enabled") or noweb_cfg.get("markOnline") is not False:
+                        logger.info(
+                            "Updating WAHA session '%s' config (markOnline=False, store.enabled=True) and restarting...",
+                            WAHA_SESSION,
+                        )
                         await client.put(
                             f"{WAHA_BASE_URL}/api/sessions/{WAHA_SESSION}",
                             headers=headers,
                             json=session_config,
                         )
+                        await client.post(
+                            f"{WAHA_BASE_URL}/api/sessions/{WAHA_SESSION}/restart",
+                            headers=headers,
+                        )
+                        for _ in range(10):
+                            await asyncio.sleep(2)
+                            r_chk = await client.get(
+                                f"{WAHA_BASE_URL}/api/sessions/{WAHA_SESSION}", headers=headers
+                            )
+                            if r_chk.status_code == 200 and r_chk.json().get("status") == "WORKING":
+                                break
                     else:
-                        logger.info("WAHA session '%s' already has NOWEB store enabled.", WAHA_SESSION)
+                        logger.info(
+                            "WAHA session '%s' already configured (markOnline=False, store.enabled=True).",
+                            WAHA_SESSION,
+                        )
+                    await set_waha_presence_offline(client)
                     return
                 elif resp.status_code == 404:
-                    logger.info("Creating WAHA session '%s' with NOWEB store enabled...", WAHA_SESSION)
+                    logger.info(
+                        "Creating WAHA session '%s' with markOnline=False and NOWEB store enabled...",
+                        WAHA_SESSION,
+                    )
                     await client.post(
                         f"{WAHA_BASE_URL}/api/sessions",
                         headers=headers,
@@ -556,19 +626,20 @@ async def configure_waha_session() -> None:
 async def send_human_like_whatsapp_reply(
     chat_id: str, reply_text: str, reply_to_msg_id: Optional[str] = None
 ) -> Optional[str]:
-    """Send seen, startTyping, wait proportional human delay, stopTyping, and sendText."""
+    """Optionally sendSeen, startTyping, wait proportional human delay, stopTyping, sendText, and restore offline presence."""
     headers = {"X-Api-Key": WAHA_API_KEY, "Content-Type": "application/json"}
     async with httpx.AsyncClient(timeout=20.0) as client:
-        # 1. Mark message as seen
-        seen_payload: Dict[str, Any] = {"session": WAHA_SESSION, "chatId": chat_id}
-        if reply_to_msg_id:
-            seen_payload["messageIds"] = [reply_to_msg_id]
-        try:
-            await client.post(
-                f"{WAHA_BASE_URL}/api/sendSeen", headers=headers, json=seen_payload
-            )
-        except Exception as exc:
-            logger.debug("sendSeen non-fatal warning: %s", exc)
+        # 1. Only mark message as seen if explicitly enabled (keeps unread badge & push notifications on phone)
+        if MARK_MESSAGES_SEEN:
+            seen_payload: Dict[str, Any] = {"session": WAHA_SESSION, "chatId": chat_id}
+            if reply_to_msg_id:
+                seen_payload["messageIds"] = [reply_to_msg_id]
+            try:
+                await client.post(
+                    f"{WAHA_BASE_URL}/api/sendSeen", headers=headers, json=seen_payload
+                )
+            except Exception as exc:
+                logger.debug("sendSeen non-fatal warning: %s", exc)
 
         # 2. Start typing indicator
         try:
@@ -612,6 +683,10 @@ async def send_human_like_whatsapp_reply(
             bot_sent_message_ids.add(sent_id)
             if len(bot_sent_message_ids) > 1000:
                 bot_sent_message_ids.pop()
+
+        # 6. Immediately return session presence to 'offline' so future incoming messages notify the phone
+        await asyncio.sleep(1.0)
+        await set_waha_presence_offline(client)
         return sent_id
 
 
@@ -1042,13 +1117,8 @@ async def handle_incoming_message(payload: Dict[str, Any]) -> None:
     if not body:
         return
 
-    chat_id = normalize_chat_id(raw_from)
-    to_id = normalize_chat_id(raw_to)
-    if chat_id.endswith("@lid") or to_id.endswith("@lid"):
-        async with httpx.AsyncClient(timeout=8.0) as client:
-            lid_map = await fetch_waha_lid_map(client)
-            chat_id = lid_map.get(chat_id, chat_id)
-            to_id = lid_map.get(to_id, to_id)
+    chat_id = await resolve_jid_via_lid_cache(raw_from)
+    to_id = await resolve_jid_via_lid_cache(raw_to)
 
     # 1. Ignore status broadcasts & channels
     if (
@@ -1145,8 +1215,10 @@ async def lifespan(app: FastAPI):
     init_sheets_service()
     asyncio.create_task(configure_waha_session())
     poll_task = asyncio.create_task(poll_pending_sheets_replies())
+    presence_task = asyncio.create_task(keep_presence_offline_loop())
     yield
     poll_task.cancel()
+    presence_task.cancel()
 
 
 app = FastAPI(title="WhatsApp Gemini Bridge", lifespan=lifespan)
@@ -1159,7 +1231,13 @@ async def health() -> Dict[str, Any]:
         "model": GEMINI_MODEL,
         "waha_session": WAHA_SESSION,
         "sheets_sync_enabled": bool(GOOGLE_SHEET_ID),
+        "mark_messages_seen": MARK_MESSAGES_SEEN,
     }
+
+
+async def _on_waha_session_working() -> None:
+    await asyncio.sleep(2.0)
+    await set_waha_presence_offline()
 
 
 @app.post("/webhook/whatsapp")
@@ -1174,4 +1252,6 @@ async def whatsapp_webhook(
     elif event == "session.status":
         status = (data.get("payload") or {}).get("status")
         logger.info("WAHA session status changed: %s", status)
+        if status == "WORKING":
+            background_tasks.add_task(_on_waha_session_working)
     return {"status": "received"}
